@@ -29,17 +29,20 @@
 #include "hal.h"
 
 //----------------------------------------------------------------------------
-#define SPIEEPROM_24BIT_ADDRESS
+#define SPIEEPROM_16BIT_ADDRESS
+//#define SPIEEPROM_24BIT_ADDRESS
 
 //----------------------------------------------------------------------------
 #ifdef SPIEEPROM_16BIT_ADDRESS
 	#define SPIEEPROM_PAGE_SIZE			32
 	#define SPIEEPROM_PAGE_SIZE_SHIFT 	5
+	#define SPIEEPROM_PAGE_MASK			0x000001F
 	#define SPIEEPROM_NUMBER_PAGES		128
 #endif
 #ifdef SPIEEPROM_24BIT_ADDRESS
 	#define SPIEEPROM_PAGE_SIZE			256
 	#define SPIEEPROM_PAGE_SIZE_SHIFT 	8
+	#define SPIEEPROM_PAGE_MASK			0x00000FF
 	#define SPIEEPROM_NUMBER_PAGES		4096
 #endif
 #ifndef SPIEEPROM_PAGE_SIZE
@@ -75,6 +78,9 @@ extern spiEepromDriver spiEepromD1;
 void spiEepromStart(spiEepromDriver * sedp, 
 					const spiEepromConfig * secp,
 					SPIDriver * spip);
+
+void spiEepromReadBytes(spiEepromDriver * sedp, uint32_t address, uint8_t * buf, uint32_t len);
+void spiEepromWriteBytes(spiEepromDriver * sedp, uint32_t address, const uint8_t * buf, uint32_t len);
 
 void spiEepromReadPage(spiEepromDriver * sedp, uint16_t page, uint8_t * buf);
 void spiEepromWritePage(spiEepromDriver * sedp, uint16_t page, const uint8_t * buf);

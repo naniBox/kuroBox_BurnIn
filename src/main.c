@@ -35,27 +35,16 @@
 #include "kb_buttons.h"
 #include "kb_gpio.h"
 
-//-----------------------------------------------------------------------------
-#define FACTORY_CONFIG_MAGIC				0x426b426e	// nBkB ;)
-#define FACTORY_CONFIG_VERSION				0x01010101
-typedef struct factory_config_t factory_config_t;
-struct __PACKED__ factory_config_t
-{
-	uint32_t preamble;
-	uint32_t version;
-	uint16_t checksum;
-	uint32_t serial_number;
-	uint32_t tcxo_compensation;
-	uint32_t rtc_compensation;
-	uint8_t __pad[SPIEEPROM_PAGE_SIZE - (4+4+4+2+4+4)];
 
-};
-STATIC_ASSERT(sizeof(factory_config_t)==SPIEEPROM_PAGE_SIZE, SPIEEPROM_PAGE_SIZE);
+//-----------------------------------------------------------------------------
+#include "kbb_types.h"
+KBB_TYPES_VERSION_CHECK(0x0001)
+
+//-----------------------------------------------------------------------------
 factory_config_t factory_config;
 
 //-----------------------------------------------------------------------------
 // forward declarations
-static void gptcb(GPTDriver *gptp);
 static void gps_timepulse(EXTDriver *extp, expchannel_t channel);
 
 //-----------------------------------------------------------------------------
@@ -129,19 +118,17 @@ static const EXTConfig extcfg = {
 };
 
 //-----------------------------------------------------------------------------
-static const GPTConfig gptcfg = {
-	84000000,
-	gptcb,
-	0
-};
-
-//-----------------------------------------------------------------------------
 // static data
 static uint8_t lcd_buffer[ST7565_BUFFER_SIZE];
 volatile bool_t pps_changed;
-volatile uint32_t pps_diff;
-volatile uint32_t pps_time;
-volatile uint32_t pps;
+volatile int32_t pps_diff;
+volatile int32_t pps_time;
+volatile int32_t pps;
+
+volatile bool_t one_sec_pps_changed;
+volatile int32_t one_sec_pps_diff_diff;
+volatile int32_t one_sec_pps_diff;
+volatile int32_t one_sec_pps;
 
 static char charbuf[128];
 static MemoryStream msb;
@@ -155,15 +142,10 @@ static MemoryStream msb;
 //#define PASSES 10
 
 // we store the times so we can extract meaningful data at the end
-uint32_t times[PASSES];
+int32_t times[PASSES];
 
 
 //-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-static void gptcb(GPTDriver *gptp)
-{
-	(void)gptp;
-}
 
 //-----------------------------------------------------------------------------
 static void
@@ -172,13 +154,36 @@ gps_timepulse(EXTDriver *extp, expchannel_t channel)
 	(void)extp;
 	(void)channel;
 
-	uint32_t b = halGetCounterValue();
+	int32_t b = halGetCounterValue();
 	pps_diff = b-pps_time;
 	pps_time = b;
 	pps_changed = TRUE;
 	pps++;
+	kbg_toggleLED1();
+}
+
+//-----------------------------------------------------------------------------
+static void
+one_sec_cb(GPTDriver * gptp)
+{
+	(void)gptp;
+
+	int32_t b = halGetCounterValue();
+	one_sec_pps_diff_diff = (b-pps_time)-one_sec_pps_diff;
+	one_sec_pps_diff = b-pps_time;
+	one_sec_pps_changed = TRUE;
+	one_sec_pps++;
 	kbg_toggleLED2();
 }
+
+//-----------------------------------------------------------------------------
+static const GPTConfig one_sec_cfg =
+{
+	84000000,		// max clock!
+	one_sec_cb,
+	0
+};
+
 
 //-----------------------------------------------------------------------------
 int
@@ -211,8 +216,7 @@ kuroBoxInit(void)
 	// set initial button state.
 	kuroBoxButtonsInit();
 
-	gptStart(&GPTD2, &gptcfg);
-	gptStartContinuous(&GPTD2, 84000000);
+	gptStart(&GPTD2, &one_sec_cfg);
 
 	// indicate we're ready
 	chThdSleepMilliseconds(100);
@@ -235,12 +239,16 @@ cmd_print(BaseSequentialStream * chp, int argc, char * argv[])
 
 	chprintf(chp, "=====  %s  =====\n", BOARD_NAME);
 	chprintf(chp, "Config:\n");
-	chprintf(chp, "  Preamble  : 0x%.8X\n", factory_config.preamble);
-	chprintf(chp, "  Version   : 0x%.8X\n", factory_config.version);
-	chprintf(chp, "  SerialNum : %d\n", 	factory_config.serial_number);
-	chprintf(chp, "  Checksum  : 0x%.4X\n", factory_config.checksum);
-	chprintf(chp, "  TCXO      : %d\n",     factory_config.tcxo_compensation);
-	chprintf(chp, "  RTC       : %d\n",     factory_config.rtc_compensation);
+	chprintf(chp, "  Preamble           : 0x%.8X\n",	factory_config.preamble);
+	chprintf(chp, "  Version            : 0x%.8X\n",	factory_config.version);
+	chprintf(chp, "  Hardware Rev       : 0x%.8X\n",	factory_config.hardware_revision);
+	chprintf(chp, "  SerialNum          : %d\n", 		factory_config.serial_number);
+	// @TODO make sure that the number matches the lenth
+	chprintf(chp, "  User String        : '%-32s'\n", 	factory_config.user_string);
+	chprintf(chp, "  Checksum           : 0x%.4X\n",	factory_config.checksum);
+	chprintf(chp, "  TCXO Compensation  : %d\n",		factory_config.tcxo_compensation);
+	chprintf(chp, "  RTC Compensation   : %d\n",		factory_config.rtc_compensation);
+	chprintf(chp, "  Vin Compensation   : %d\n",		factory_config.vin_compensation);
 	chprintf(chp, "\n");
 }
 
@@ -252,11 +260,18 @@ cmd_read(BaseSequentialStream  *chp, int argc, char * argv[])
 	(void)argv;
 
 	uint8_t * eeprombuf = (uint8_t*) &factory_config;
-	while( spiEepromWIP(&spiEepromD1) )
-	{}
-	spiEepromReadPage(&spiEepromD1, 0, eeprombuf);
+	spiEepromReadBytes(&spiEepromD1, FACTORY_CONFIG_ADDRESS, eeprombuf, FACTORY_CONFIG_SIZE);
 
 	chprintf(chp, "Config read\n");
+	factory_config.user_string[FACTORY_CONFIG_USER_MAX_LENGTH-1] = '\0';
+
+	uint16_t checksum = calc_checksum_16((uint8_t*)&factory_config,
+			sizeof(factory_config)-sizeof(factory_config.checksum));
+	if ( checksum != factory_config.checksum )
+	{
+		chprintf(chp, "Err: checksum mismatch: calc(0x%.4X) vs read(0x%.4X)\n",
+				checksum, factory_config.checksum);
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -268,17 +283,39 @@ cmd_write(BaseSequentialStream * chp, int argc, char * argv[])
 
 	factory_config.preamble = FACTORY_CONFIG_MAGIC;
 	factory_config.version = FACTORY_CONFIG_VERSION;
-	factory_config.checksum = calc_checksum_16((uint8_t*)&factory_config, sizeof(factory_config));
+	factory_config.checksum = calc_checksum_16((uint8_t*)&factory_config,
+			sizeof(factory_config)-sizeof(factory_config.checksum));
 
 	uint8_t * eeprombuf = (uint8_t*) &factory_config;
-	spiEepromEnableWrite(&spiEepromD1);
-	spiEepromWritePage(&spiEepromD1, 0, eeprombuf);
-
-	volatile uint32_t count = 0;
-	while( spiEepromWIP(&spiEepromD1) ) {count++;}
-	spiEepromDisableWrite(&spiEepromD1);
+	spiEepromWriteBytes(&spiEepromD1, FACTORY_CONFIG_ADDRESS, eeprombuf, FACTORY_CONFIG_SIZE);
 
 	chprintf(chp, "Config written\n");
+}
+
+//-----------------------------------------------------------------------------
+static void
+cmd_wipe(BaseSequentialStream * chp, int argc, char * argv[])
+{
+	(void)argc;
+	(void)argv;
+
+	memset(&factory_config, 0, FACTORY_CONFIG_SIZE);
+
+	chprintf(chp, "Config wiped\n");
+}
+
+//-----------------------------------------------------------------------------
+static void
+cmd_wipe_eeprom(BaseSequentialStream * chp, int argc, char * argv[])
+{
+	(void)argc;
+	(void)argv;
+
+	memset(&factory_config, 0, FACTORY_CONFIG_SIZE);
+	uint8_t * eeprombuf = (uint8_t*) &factory_config;
+	spiEepromWriteBytes(&spiEepromD1, FACTORY_CONFIG_ADDRESS, eeprombuf, FACTORY_CONFIG_SIZE);
+
+	chprintf(chp, "Config wiped IN EEPROM\n");
 }
 
 //-----------------------------------------------------------------------------
@@ -286,7 +323,10 @@ static void
 cmd_serialnum(BaseSequentialStream * chp, int argc, char * argv[])
 {
 	if ( argc == 0 )
+	{
+		chprintf(chp, "Err: no args\n");
 		return;
+	}
 
 	factory_config.serial_number = atoi(argv[0]);
 	chprintf(chp, "Setting serial number to: %d\n", factory_config.serial_number);
@@ -299,13 +339,62 @@ cmd_rtc(BaseSequentialStream * chp, int argc, char * argv[])
 	(void)chp;
 	(void)argc;
 	(void)argv;
+	chprintf(chp, "RTC compensation not implemented yet\n");
 }
+
+//-----------------------------------------------------------------------------
+static void
+cmd_vin(BaseSequentialStream * chp, int argc, char * argv[])
+{
+	(void)chp;
+	(void)argc;
+	(void)argv;
+	chprintf(chp, "Vin compensation not implemented yet\n");
+}
+
+//-----------------------------------------------------------------------------
+static void
+cmd_hardwarerev(BaseSequentialStream * chp, int argc, char * argv[])
+{
+	if ( argc == 0 )
+	{
+		chprintf(chp, "Err: no args\n");
+		return;
+	}
+
+	char * ptr = NULL;
+	factory_config.hardware_revision = strtol(argv[0], &ptr, 16);
+	chprintf(chp, "Setting hardware revision to: 0x%.8x\n", factory_config.hardware_revision);
+}
+
+//-----------------------------------------------------------------------------
+static void
+cmd_user_string(BaseSequentialStream * chp, int argc, char * argv[])
+{
+	if ( argc == 0 )
+	{
+		chprintf(chp, "Err: no args\n");
+		return;
+	}
+
+	uint32_t len = strlen(argv[0]);
+	if ( len >= FACTORY_CONFIG_USER_MAX_LENGTH )
+	{
+		chprintf(chp, "Err: user string too long: %d chars (max %d)\n", len,
+				FACTORY_CONFIG_USER_MAX_LENGTH);
+		return;
+	}
+	memset(factory_config.user_string, 0, FACTORY_CONFIG_USER_MAX_LENGTH);
+	strncpy(factory_config.user_string, argv[0], len);
+	chprintf(chp, "Setting user string to: '%s'\n", factory_config.user_string);
+}
+
 
 //-----------------------------------------------------------------------------
 static void
 cmd_tcxo(BaseSequentialStream * chp, int argc, char * argv[])
 {
-	uint32_t passes = 0;
+	int32_t passes = 0;
 	if ( argc == 0 )
 	{
 		passes = PASSES;
@@ -334,7 +423,7 @@ cmd_tcxo(BaseSequentialStream * chp, int argc, char * argv[])
 		chThdSleepMilliseconds(50);
 	}
 
-	kbg_setLED2(0);
+	kbg_setLED1(0);
 
 	//--------------------------------------------------------------------------
 	// doing the XTAL run first
@@ -342,16 +431,16 @@ cmd_tcxo(BaseSequentialStream * chp, int argc, char * argv[])
 	st7565_clear(&ST7565D1);
 	chprintf(chp, "pass,PASSES,pps_diff,diff_from_parity\n");
 
-	for ( uint32_t pass = 0 ; pass < passes ; )
+	for ( int32_t pass = 0 ; pass < passes ; )
 	{
 		chThdSleepMilliseconds(50);
 		if ( pps_changed )
 		{
-			kbg_setLED1(1);
+			kbg_setLED3(1);
 			times[pass] = pps_diff;
 			// this may be negative!
 			int32_t diff_from_parity = 168000000 - pps_diff;
-			chprintf(chp, "%6d,%6d,%14d,%14d\n", pass, passes, pps_diff, diff_from_parity);
+			chprintf(chp, "%6d,%6d,%14d,%14d\n", pass+1, passes, pps_diff, diff_from_parity);
 			pps_changed = FALSE;
 			pass++;
 
@@ -373,14 +462,14 @@ cmd_tcxo(BaseSequentialStream * chp, int argc, char * argv[])
 			st7565_clear(&ST7565D1);
 
 			chThdSleepMilliseconds(10);
-			kbg_setLED1(0);
+			kbg_setLED3(0);
 		}
 	}
 
 	int32_t max = -2147483647;
 	int32_t min = 2147483647;
 	int32_t avg = 0;
-	for ( uint32_t pass = 0 ; pass < passes ; pass++ )
+	for ( int32_t pass = 0 ; pass < passes ; pass++ )
 	{
 		int32_t t = (168000000 - times[pass]);
 		if ( max < t ) max = t;
@@ -390,7 +479,7 @@ cmd_tcxo(BaseSequentialStream * chp, int argc, char * argv[])
 	avg /= passes;
 
 	uint32_t std_dev = 0;
-	for ( uint32_t pass = 0 ; pass < passes ; pass++ )
+	for ( int32_t pass = 0 ; pass < passes ; pass++ )
 	{
 		int32_t diff = avg - (168000000 - times[pass]);
 		std_dev += diff*diff;
@@ -422,24 +511,115 @@ cmd_tcxo(BaseSequentialStream * chp, int argc, char * argv[])
 	st7565_display(&ST7565D1);
 	st7565_clear(&ST7565D1);
 
-	factory_config.tcxo_compensation = avg;}
+	factory_config.tcxo_compensation = avg;
+}
+
+
+//-----------------------------------------------------------------------------
+static void
+cmd_tcxo_test(BaseSequentialStream * chp, int argc, char * argv[])
+{
+	uint32_t passes = 0;
+	if ( argc == 0 )
+	{
+		passes = PASSES;
+	}
+	else
+	{
+		passes = atoi(argv[0]);
+		if ( passes > PASSES )
+		{
+			chprintf(chp, "WARNING: you asked for too many passes (%d), doing just (%d)\n",
+					passes, PASSES);
+			passes = PASSES;
+		}
+	}
+
+	//--------------------------------------------------------------------------
+	gptStart(&GPTD2, &one_sec_cfg);
+	gptStartContinuous(&GPTD2, 84000000-(factory_config.tcxo_compensation/2));
+
+	// wait X seconds to make sure the GPS has started up...
+	pps = 0;
+	while (pps < 5)
+	{
+		st7565_clear(&ST7565D1);
+		st7565_drawstring(&ST7565D1, 0, 0, "TCXO vs GPS TEST");
+		INIT_CBUF();
+		chprintf(bss, "Waiting on GPS: %d", 5-pps);
+		st7565_drawstring(&ST7565D1, 0, 1, charbuf);
+		st7565_display(&ST7565D1);
+		chThdSleepMilliseconds(50);
+	}
+
+	kbg_setLED2(0);
+
+	st7565_clear(&ST7565D1);
+	chprintf(chp, "pass,PASSES,pps_diff\n");
+
+	for ( uint32_t pass = 0 ; pass < passes ; )
+	{
+		chThdSleepMilliseconds(50);
+		if ( one_sec_pps_changed )
+		{
+			kbg_setLED3(1);
+			times[pass] = one_sec_pps_diff;
+			int32_t diff_from_parity = 168000000 - pps_diff;
+			chprintf(chp, "%6d,%6d,%14d,%6d,%14d\n", pass+1, passes,
+					one_sec_pps_diff, one_sec_pps_diff_diff, diff_from_parity);
+			one_sec_pps_changed = FALSE;
+			pass++;
+
+			st7565_drawstring(&ST7565D1, 0, 0, "TCXO vs GPS CONF");
+
+			INIT_CBUF();
+			chprintf(bss,"Doing %d passes", passes);
+			st7565_drawstring(&ST7565D1, 0, 1, charbuf);
+
+			INIT_CBUF();
+			chprintf(bss,"Pass: %d", pass);
+			st7565_drawstring(&ST7565D1, 0, 2, charbuf);
+
+			INIT_CBUF();
+			chprintf(bss,"Time diff: %d", one_sec_pps_diff);
+			st7565_drawstring(&ST7565D1, 0, 3, charbuf);
+
+			st7565_display(&ST7565D1);
+			st7565_clear(&ST7565D1);
+
+			chThdSleepMilliseconds(10);
+			kbg_setLED3(0);
+		}
+	}
+	gptStopTimer(&GPTD2);
+	gptStop(&GPTD2);
+}
 
 //-----------------------------------------------------------------------------
 static const ShellCommand commands[] =
 {
 	{"tcxo", 		cmd_tcxo},
 	{"rtc", 		cmd_rtc},
-	{"serialnum",	cmd_serialnum},
+	{"vin", 		cmd_vin},
+	{"serial",		cmd_serialnum},
+	{"hwrev",		cmd_hardwarerev},
+	{"user",		cmd_user_string},
+
+	{"tcxo_test", 	cmd_tcxo_test},
+
 	{"print", 		cmd_print},
 	{"read", 		cmd_read},
 	{"write", 		cmd_write},
+	{"wipe", 		cmd_wipe},
+	{"wipe_eeprom", cmd_wipe_eeprom},
+
 	{NULL, NULL}
 };
 
 //-----------------------------------------------------------------------------
 static const ShellConfig shell_cfg =
 {
-	(BaseSequentialStream *)&SD2,
+	(BaseSequentialStream *)&SD1,
 	commands
 };
 

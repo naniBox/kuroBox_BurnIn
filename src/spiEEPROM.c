@@ -77,39 +77,80 @@ void
 spiEepromReadPage(spiEepromDriver * sedp, uint16_t page, uint8_t * buf)
 {
 	uint32_t addr = page << SPIEEPROM_PAGE_SIZE_SHIFT;
+	spiEepromReadBytes(sedp, addr, buf, SPIEEPROM_PAGE_SIZE);
+}
+
+//----------------------------------------------------------------------------
+void
+spiEepromWritePage(spiEepromDriver * sedp, uint16_t page, const uint8_t * buf)
+{
+	uint32_t addr = page << SPIEEPROM_PAGE_SIZE_SHIFT;
+	spiEepromWriteBytes(sedp, addr, buf, SPIEEPROM_PAGE_SIZE);
+}
+
+//----------------------------------------------------------------------------
+void
+spiEepromReadBytes(spiEepromDriver * sedp, uint32_t address, uint8_t * buf, uint32_t len)
+{
+	while( spiEepromWIP(sedp) )
+	{}
 
 	spiStart(sedp->spip, &sedp->cfgp->spicfg);
 	spiSelect(sedp->spip);
 	spiPolledExchange(sedp->spip, OP_READ);
 #ifdef SPIEEPROM_24BIT_ADDRESS
-	spiPolledExchange(sedp->spip, (addr>>16)&0xff);
+	spiPolledExchange(sedp->spip, (address>>16)&0xff);
 #endif
-	spiPolledExchange(sedp->spip, (addr>>8)&0xff);	
-	spiPolledExchange(sedp->spip, addr&0xff);		
-	for ( uint16_t idx = 0 ; idx < SPIEEPROM_PAGE_SIZE ; ++idx )
+	spiPolledExchange(sedp->spip, (address>>8)&0xff);
+	spiPolledExchange(sedp->spip, address&0xff);
+	for ( uint32_t idx = 0 ; idx < len ; ++idx )
 		*buf++ = spiPolledExchange(sedp->spip, 0);
 	spiUnselect(sedp->spip);
 }
 
 //----------------------------------------------------------------------------
 void
-spiEepromWritePage(spiEepromDriver * sedp, uint16_t page, const uint8_t * buf)
-{	
-	uint32_t addr = page << SPIEEPROM_PAGE_SIZE_SHIFT;
-
+spiEepromWriteBytes(spiEepromDriver * sedp, uint32_t address, const uint8_t * buf, uint32_t len)
+{
 	spiStart(sedp->spip, &sedp->cfgp->spicfg);
-	spiSelect(sedp->spip);
 
-	spiPolledExchange(sedp->spip, OP_WRITE);
+	while( spiEepromWIP(sedp) )
+	{}
+
+	uint32_t current_address = address;
+	while ( len )
+	{
+		uint32_t len_in_page = SPIEEPROM_PAGE_SIZE - ( current_address & SPIEEPROM_PAGE_MASK );
+		if ( len_in_page > len )
+			len_in_page = len;
+
+		spiEepromEnableWrite(sedp);
+		spiSelect(sedp->spip);
+		spiPolledExchange(sedp->spip, OP_WRITE);
+
 #ifdef SPIEEPROM_24BIT_ADDRESS
-	spiPolledExchange(sedp->spip, (addr>>16)&0xff);
+		spiPolledExchangeI(sedp->spip, (current_address>>16)&0xff);
 #endif
-	spiPolledExchange(sedp->spip, (addr>>8)&0xff);
-	spiPolledExchange(sedp->spip, addr&0xff);
-	for ( uint16_t idx = 0 ; idx < SPIEEPROM_PAGE_SIZE ; ++idx )
-		spiPolledExchange(sedp->spip, *buf++);
+		spiPolledExchange(sedp->spip, (current_address>>8)&0xff);
+		spiPolledExchange(sedp->spip, current_address&0xff);
 
-	spiUnselect(sedp->spip);
+		for ( uint32_t idx = 0 ; idx < len_in_page ; ++idx )
+			spiPolledExchange(sedp->spip, *buf++);
+
+		spiUnselect(sedp->spip);
+		while( spiEepromWIP(sedp) )
+		{}
+		spiEepromDisableWrite(sedp);
+
+		len -= len_in_page;
+
+		if ( len )
+		{
+			current_address >>= SPIEEPROM_PAGE_SIZE_SHIFT;
+			current_address++;
+			current_address <<= SPIEEPROM_PAGE_SIZE_SHIFT;
+		}
+	}
 }
 
 //----------------------------------------------------------------------------
